@@ -1,0 +1,20 @@
+# 依赖 / 构建产物 / 日志
+node_modules/
+**/node_modules/
+dist/
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# 环境变量与本地覆盖
+.env
+.env.*
+
+# TypeScript 增量构建缓存
+*.tsbuildinfo
+
+# 临时 / 测试残留
+.tmp/
+*.tmp
+**/*.trash-*

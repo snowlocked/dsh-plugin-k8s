@@ -1,0 +1,52 @@
+{
+  "name": "@snowlocked/dsh-k8s-console",
+  "version": "0.1.0",
+  "description": "DSH K8s 控制台插件：管理 kubeconfig，点击即开会话 Tab（同一集群可开多个），每个会话含「kubectl 命令控制台」与「AI 对话」两个子页；AI 复用 DSH 自身模型配置。",
+  "license": "MIT",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "prepack": "node ../../build.mjs",
+    "build": "node ../../build.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "slots",
+        "locale"
+      ],
+      "platform": "web"
+    },
+    "engines": {
+      "dsh": ">=0.1.1-rc.1"
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "kubernetes",
+    "k8s",
+    "kubectl",
+    "kubeconfig",
+    "ai"
+  ]
+}

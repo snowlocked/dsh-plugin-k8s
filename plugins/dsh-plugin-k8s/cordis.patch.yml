@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-k8s-console
+      name: '@snowlocked/dsh-k8s-console'
+      config: {}
