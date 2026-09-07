@@ -47,6 +47,19 @@ npm run watch        # 开发热重建
 | `/ai/models` | 枚举 DSH 已配置模型 |
 | `/ai/chat` | 多轮对话（SSE：delta → done / error / aborted） |
 
+## 对话内 AI 工具（普通会话直接查集群）
+
+服务端额外向 DSH 的 tools / systemPrompt 注册两个只读工具，主对话里的 AI 无需打开面板即可使用：
+
+| 工具 | 作用 |
+| --- | --- |
+| `k8s_kubeconfigs` | 列出已保存 kubeconfig（id、名称、contexts、current-context、server，不含凭据） |
+| `k8s_query` | 在指定 kubeconfig（可选 context/namespace）上执行**只读** kubectl，返回文本 |
+
+- 只读强制：命令动词白名单 `get / describe / logs / top / explain / version / api-resources / api-versions / auth can-i / cluster-info`；写类动词（apply/delete/exec/scale/port-forward…）一律拒绝并提示去面板手动执行。
+- 用法示例（对话中说“查一下 dev 集群的 pod”即可）：先 `k8s_kubeconfigs` 定位 id/名称 → `k8s_query(kubeconfig=…, command="get pods -A")`。
+- 输出上限 512KB、命令 20s 超时、返回自动截断提示；依赖 `@deepseek-ai/dsh-tools`（宿主提供），不可用时自动降级不影响其余功能。
+
 ## 安装到 DSH
 
 与数据库插件同一套方式（link 开发 / npm registry 两种）：
@@ -70,7 +83,7 @@ dsh plugin --profile web add @snowlocked/dsh-k8s-console
 ## 与数据库插件的差异点（按需）
 
 - 数据库插件点同一张表 = **定位**旧 Tab；本插件点同一 kubeconfig = **新建** Tab（用户明确要求）。
-- 本插件未注册任何“对话内 AI 工具”（不占用系统提示词），AI 能力全部收在插件面板内部。
+- 本插件同时注册了「面板内 AI 对话」（经 HTTP `/ai/chat`，复用 DSH 模型）与「对话内只读工具」（`k8s_kubeconfigs` / `k8s_query`，见上节）。工具只读、不占面板状态；需要写操作时引导用户去面板手动执行。
 - kubectl 执行是非交互、带超时与输出上限的受控子进程，绝不在主进程内拼 shell 字符串（避免注入与命令解析歧义）。
 
 ## 安全说明

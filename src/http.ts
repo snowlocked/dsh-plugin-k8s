@@ -239,7 +239,7 @@ export function buildApiRoutes(deps: ApiDeps): HttpRoute[] {
     sendJson(response, 200, {
       ok: true,
       name: 'dsh-plugin-k8s',
-      version: '0.1.0',
+      version: '0.2.0',
       dataDir: deps.store.dataDir,
       kubeconfigCount: entries.length,
       kubectl: probe,

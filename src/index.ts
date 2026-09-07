@@ -11,6 +11,9 @@ import { createKubeStore, defaultDataDir, isValidKubeId } from './store.ts'
 import type { KubeStore } from './store.ts'
 import { buildApiRoutes } from './http.ts'
 import type { HttpRequest, HttpResponse, HttpRoute } from './http.ts'
+import { kubeconfigCatalogLines, registerK8sTools } from './tools.ts'
+
+export { assertReadOnlyCommand } from './tools.ts'
 
 export const name = 'dsh-plugin-k8s'
 /** 服务端需要等待注入的服务（webServer 最先，其余按需取） */
@@ -41,6 +44,8 @@ interface CtxLike {
 interface SubCtxLike {
   effect(callback: () => void | (() => void), label?: string): void
   webServer?: { register(route: HttpRoute): () => void }
+  tools?: { register(tool: unknown): () => void }
+  systemPrompt?: { section(options: unknown): () => void }
 }
 
 function clamp(value: unknown, fallback: number, min: number, max: number): number {
@@ -86,6 +91,52 @@ export function apply(ctx: CtxLike, config: PluginConfig = {}): void {
         for (const dispose of disposers) dispose()
       }
     }, 'dsh-plugin-k8s: http api')
+  })
+
+  // 对话 AI 可直接调用的 K8s 只读工具（k8s_kubeconfigs / k8s_query）
+  ctx.inject(['tools'], (sctx) => {
+    sctx.effect(() => {
+      let dispose: (() => void) | undefined
+      registerK8sTools(sctx as unknown as { tools: { register(tool: unknown): () => void } }, {
+        store,
+        locator,
+        log,
+      }).then((result) => {
+        dispose = result
+        log('info', 'K8s 对话工具注册完成（k8s_kubeconfigs / k8s_query）')
+      }).catch((reason) => {
+        log('warn', `K8s 对话工具注册失败：${reason instanceof Error ? reason.message : String(reason)}`)
+      })
+      return () => dispose?.()
+    }, 'dsh-plugin-k8s: k8s tools')
+  })
+
+  // 系统提示：告诉对话中的 AI 如何使用这些工具（含当前已保存 kubeconfig 的目录快照）
+  ctx.inject(['systemPrompt'], (sctx) => {
+    sctx.effect(() => {
+      const section = (sctx.systemPrompt as { section(options: unknown): () => void }).section({
+        name: 'dsh-plugin-k8s:tools',
+        order: 510,
+        text: [
+          '## Kubernetes 工具（dsh-plugin-k8s）',
+          '',
+          '你可以在对话里直接查“K8s 控制台”插件已保存的集群配置（只读）：',
+          '- kubeconfig 参数：kubeconfig 的 **id 或名称**都行（见下方目录）。拿不准先调 k8s_kubeconfigs。',
+          '- 先 k8s_kubeconfigs 确认目标集群，再 k8s_query 执行只读命令；',
+          '  namespace/context 用 k8s_query 的参数传，不要写进 command。',
+          '- k8s_query 只支持只读动词：get / describe / logs / top / explain / version / api-resources /',
+          '  api-versions / auth can-i / cluster-info；写类动词（apply/delete/edit/scale/exec…）会被拒绝，',
+          '  如需写操作，提醒用户打开左侧“K8s”工作台在命令控制台手动执行。',
+          '示例：“查一下 dev 集群的 pod”→ k8s_kubeconfigs 找 dev → k8s_query(kubeconfig=…, command="get pods -A")；',
+          '“看 xx 命名空间的 deployment 状态”→ k8s_query(…, namespace=xx, command="get deployments")。',
+          '输出较大时会被截断并提示；全部查询只读，不会改动集群。',
+          '',
+          '当前已保存的 kubeconfig（插件启动时快照，如有出入以 k8s_kubeconfigs 返回为准）：',
+          ...kubeconfigCatalogLines(store),
+        ].join('\n'),
+      })
+      return section
+    }, 'dsh-plugin-k8s: prompt section')
   })
 
   log('info', `插件已加载：数据目录=${dataDir}，命令超时=${runtime.runTimeoutMs}ms，输出上限=${Math.round(runtime.outputBytes / 1024)}KB`)

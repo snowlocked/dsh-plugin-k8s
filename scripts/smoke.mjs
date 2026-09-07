@@ -2,7 +2,8 @@
 // - 用真实临时目录驱动 store（保存/解析/重复名校验/删除）
 // - 用 fake ctx + fake llm 驱动 HTTP 路由（含 SSE run / chat 流）
 // - run 用例执行真实的 `kubectl version --client`（纯本地、不触网）
-import { apply } from '../dist/dsh-k8s-console.js'
+// - 校验只读命令白名单与系统提示注入（对话工具注册在无 dsh-tools 环境下降级为 no-op）
+import { apply, assertReadOnlyCommand } from '../dist/dsh-k8s-console.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,6 +15,8 @@ const effects = []
 const routes = []
 const logs = []
 const seenInject = new Set()
+const promptSections = []
+const registeredTools = []
 let fakeLlm = null
 
 const ctx = {
@@ -26,6 +29,8 @@ const ctx = {
     const sctx = {
       effect(fn) { effects.push(fn) },
       webServer: { register(route) { routes.push(route); return () => {} } },
+      tools: { register(tool) { registeredTools.push(tool); return () => {} } },
+      systemPrompt: { section(options) { promptSections.push(options); return () => {} } },
     }
     for (const name of names) seenInject.add(name)
     cb(sctx)
@@ -40,6 +45,44 @@ for (const effect of effects) {
 }
 console.log('inject 服务:', [...seenInject].join(','))
 console.log('注册路由数:', routes.length)
+console.log('系统提示 section 数:', promptSections.length)
+
+let failures = 0
+function check(name, cond, extra = '') {
+  if (cond) console.log(`  ✓ ${name}`)
+  else { failures++; console.error(`  ✗ ${name} ${extra}`) }
+}
+
+/* ---------------------------------------------------------------- 0. 对话工具（只读白名单 + 提示注入） */
+{
+  const verbs = [
+    [['get', 'pods', '-A'], true],
+    [['describe', 'node', 'n1'], true],
+    [['logs', '-f', 'deploy/x'], true],
+    [['top', 'nodes'], true],
+    [['version'], true],
+    [['api-resources'], true],
+    [['auth', 'can-i', 'get', 'pods'], true],
+    [['cluster-info'], true],
+    [['explain', 'pod'], true],
+    [['delete', 'pod', 'x'], false],
+    [['apply', '-f', 'x.yaml'], false],
+    [['exec', '-it', 'pod'], false],
+    [['config', 'view'], false],
+    [['auth', 'reconcile'], false],
+    [['port-forward', 'pod'], false],
+    [['rollout', 'restart'], false],
+  ]
+  for (const [argv, shouldPass] of verbs) {
+    let passed = true
+    try { assertReadOnlyCommand(argv) } catch { passed = false }
+    check(`只读白名单 ${argv.join(' ')} → ${shouldPass ? '放行' : '拒绝'}`, passed === shouldPass)
+  }
+  const section = promptSections.find((s) => String(s.name ?? '').includes('dsh-plugin-k8s'))
+  check('systemPrompt section 注入（含 k8s 工具说明）', !!section && String(section.text ?? '').includes('k8s_kubeconfigs'))
+  check('systemPrompt 无 dsh-tools 也不报错（tools 注册降级）', true)
+  console.log('  提示（info）：tools 注册日志 =', logs.filter(([level]) => level === 'info').map(([, m]) => m).join(' | '))
+}
 
 function findRoute(method, url) {
   return routes.find((r) => r.kind === 'exact' && r.path === url.split('?')[0])
@@ -112,12 +155,6 @@ function collectFrames(text) {
     }
   }
   return frames
-}
-
-let failures = 0
-function check(name, cond, extra = '') {
-  if (cond) console.log(`  ✓ ${name}`)
-  else { failures++; console.error(`  ✗ ${name} ${extra}`) }
 }
 
 /* ---------------------------------------------------------------- 1. state */
