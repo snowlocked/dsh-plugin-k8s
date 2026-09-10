@@ -56,7 +56,10 @@ button.kc-sidebar-entry[data-active='true']:hover {
   white-space: nowrap;
 }
 
-/* ---------- 面板根 ---------- */
+/* ---------- 面板根 ----------
+   中栏接管说明：工作台打开时由 overlay.tsx 把持久容器（#dsh-k8s-console）
+   以 absolute inset:0 覆盖到 Conversation 根节点上（参考番茄工作台/数据库工作台），
+   不隐藏、不修改任何宿主元素，因此这里没有任何针对宿主（头部/composer）的规则。 */
 #dsh-k8s-console {
   color: var(--kc-text);
   font-size: 13px;

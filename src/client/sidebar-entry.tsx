@@ -28,6 +28,8 @@ export function K8sSidebarEntry(props: K8sSidebarEntryProps = {}): JSX.Element {
   const tt = t
   const snapshot = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot)
   const handleClick = useCallback(() => {
+    // 侧边栏入口是往返开关：工作台停靠时头部（View 导航）已被覆盖，这里负责
+    // 打开/收回整个工作台（toggle 依 DOM 停靠状态判断，而非 panelOpen）。
     controller.toggle()
   }, [])
   return (
