@@ -1,6 +1,6 @@
 {
   "name": "@snowlocked/dsh-k8s-console",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "private": true,
   "description": "DSH K8s 控制台插件：管理 kubeconfig，点开即建会话 Tab（可重复开多个），每个会话含「kubectl 命令控制台」与「AI 对话」两个子页；AI 复用 DSH 自身模型配置。",
   "license": "MIT",

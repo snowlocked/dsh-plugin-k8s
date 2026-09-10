@@ -7,21 +7,21 @@
  */
 
 import type { KubeStore } from './store.ts'
+import type { HistoryStore } from './history.ts'
 import { join } from 'node:path'
 import { isValidKubeId } from './store.ts'
-import { K8sConsoleError } from './errors.ts'
+import { K8sConsoleError, asError } from './errors.ts'
 import {
   execKubectl,
   fallbackViewMeta,
   kubectlCommand,
   kubectlViewMeta,
-  normalizeKubectlArgs,
   probeKubectl,
   runKubectlAsync,
-  splitCommand,
   invalidateKubectlProbe,
 } from './kubectl.ts'
 import type { KubectlLocator } from './kubectl.ts'
+import { applyOutputFilters, describeFilters, parsePipeline } from './pipeline.ts'
 import { listAiModels, streamChat, buildK8sSystemPrompt } from './ai.ts'
 import type { LlmLike } from './ai.ts'
 import { parseKubeconfigMeta, normalizeMeta } from './meta.ts'
@@ -63,6 +63,7 @@ export interface ApiRuntimeConfig {
 
 export interface ApiDeps {
   store: KubeStore
+  history: HistoryStore
   locator: KubectlLocator
   runtime: ApiRuntimeConfig
   log(level: 'info' | 'warn' | 'error', message: string): void
@@ -239,7 +240,7 @@ export function buildApiRoutes(deps: ApiDeps): HttpRoute[] {
     sendJson(response, 200, {
       ok: true,
       name: 'dsh-plugin-k8s',
-      version: '0.2.0',
+      version: '0.4.0',
       dataDir: deps.store.dataDir,
       kubeconfigCount: entries.length,
       kubectl: probe,
@@ -358,12 +359,16 @@ export function buildApiRoutes(deps: ApiDeps): HttpRoute[] {
     const namespace = pickString(body, ['namespace']) ?? ''
     const timeoutMs = clampNumber(body.timeoutMs, deps.runtime.runTimeoutMs, 1_000, 15 * 60 * 1000)
 
-    let tokens: string[]
+    // 管道解析：第一段 kubectl，后续段仅放行进程内过滤器（grep/head/tail/sort/wc）
+    let pipeline
     try {
-      tokens = normalizeKubectlArgs(splitCommand(command))
-    } catch {
-      tokens = []
+      pipeline = parsePipeline(command)
+    } catch (reason) {
+      finishSseError(writer, asError(reason).message, 'BAD_PIPELINE')
+      abort.dispose()
+      return
     }
+    const tokens = pipeline.kubectl
     if (tokens.length === 0) {
       finishSseError(writer, '请输入要执行的命令（例如：get pods -A）', 'EMPTY_COMMAND')
       abort.dispose()
@@ -381,15 +386,27 @@ export function buildApiRoutes(deps: ApiDeps): HttpRoute[] {
     if (namespace.trim() !== '') argv.push('-n', namespace.trim())
     argv.push(...tokens)
 
+    const filtered = pipeline.filters.length > 0
     writer.push({
       type: 'start',
-      command: `kubectl ${argv.join(' ')}`,
+      command: `kubectl ${argv.join(' ')}${filtered ? ` | ${describeFilters(pipeline.filters)}` : ''}`,
       argv,
       kubeconfig: record.name,
       timeoutMs,
+      ...(filtered ? { filters: describeFilters(pipeline.filters) } : {}),
     })
 
     let exitSent = false
+    // 有过滤器时走缓冲模式：stdout 不实时回显，进程结束后统一过滤输出（stderr 仍实时）
+    let stdoutBuffer = ''
+    const onOutput = filtered
+      ? (channel: 'stdout' | 'stderr', text: string): void => {
+        if (channel === 'stderr') writer.push({ type: 'out', channel, text })
+        else stdoutBuffer += text
+      }
+      : (channel: 'stdout' | 'stderr', text: string): void => {
+        writer.push({ type: 'out', channel, text })
+      }
     try {
       const bin = binOf()
       const result = await execKubectl(
@@ -402,8 +419,13 @@ export function buildApiRoutes(deps: ApiDeps): HttpRoute[] {
           maxBytes: deps.runtime.outputBytes,
           signal: abort.signal,
         },
-        (channel, text) => writer.push({ type: 'out', channel, text }),
+        onOutput,
       )
+      if (filtered) {
+        const text = applyOutputFilters(stdoutBuffer, pipeline.filters)
+        if (text.length > 0) writer.push({ type: 'out', channel: 'stdout', text })
+        writer.push({ type: 'note', text: `已应用管道过滤（插件进程内执行，非 shell）：${describeFilters(pipeline.filters)}` })
+      }
       exitSent = true
       writer.push({
         type: 'exit',
@@ -412,6 +434,7 @@ export function buildApiRoutes(deps: ApiDeps): HttpRoute[] {
         reason: result.reason,
         truncated: result.truncated,
         durationMs: result.durationMs,
+        ...(filtered ? { filtered: true } : {}),
       })
       writer.end()
     } catch (reason) {
@@ -510,6 +533,75 @@ export function buildApiRoutes(deps: ApiDeps): HttpRoute[] {
     } finally {
       abort.dispose()
     }
+  })
+
+  /* ---------------- 会话历史（持久化 + 查询） ---------------- */
+
+  add('POST', `${PREFIX}/history/append`, async (request, response) => {
+    const body = toRecord(await readJsonBody(request))
+    const messageRecord = toRecord(body.message)
+    const role = pickString(messageRecord, ['role'])
+    const content = pickString(messageRecord, ['content']) ?? ''
+    if ((role !== 'user' && role !== 'assistant') || content.trim() === '') {
+      throw new K8sConsoleError('message 必须包含 role(user/assistant) 与非空 content', 'BAD_INPUT', 400)
+    }
+    const provider = pickString(messageRecord, ['provider'])
+    const model = pickString(messageRecord, ['model'])
+    const at = pickString(messageRecord, ['at'])
+    const context = pickString(body, ['context'])
+    const session = deps.history.append({
+      sessionId: pickString(body, ['sessionId']),
+      kubeId: pickString(body, ['kubeId']) ?? '',
+      kubeName: pickString(body, ['kubeName']) ?? '未知集群',
+      ...(context && context.trim() !== '' ? { context } : {}),
+      message: {
+        role,
+        content,
+        at: at && at.trim() !== '' ? at : new Date().toISOString(),
+        ...(provider ? { provider } : {}),
+        ...(model ? { model } : {}),
+        ...(messageRecord.error === true ? { error: true } : {}),
+      },
+    })
+    sendJson(response, 200, {
+      ok: true,
+      sessionId: session.id,
+      updatedAt: session.updatedAt,
+      messageCount: session.messages.length,
+    })
+  })
+
+  add('POST', `${PREFIX}/history/list`, async (request, response) => {
+    const body = toRecord(await readJsonBody(request))
+    const limit = clampNumber(body.limit, 50, 1, 200)
+    const sessions = deps.history.list({
+      ...(typeof body.keyword === 'string' && body.keyword.trim() !== '' ? { keyword: body.keyword } : {}),
+      ...(typeof body.kubeId === 'string' && body.kubeId.trim() !== '' ? { kubeId: body.kubeId } : {}),
+      limit,
+    })
+    sendJson(response, 200, { ok: true, sessions })
+  })
+
+  add('POST', `${PREFIX}/history/get`, async (request, response) => {
+    const body = toRecord(await readJsonBody(request))
+    const sessionId = pickString(body, ['sessionId']) ?? ''
+    sendJson(response, 200, { ok: true, session: deps.history.get(sessionId) })
+  })
+
+  add('POST', `${PREFIX}/history/delete`, async (request, response) => {
+    const body = toRecord(await readJsonBody(request))
+    const sessionId = pickString(body, ['sessionId']) ?? ''
+    const deleted = deps.history.remove(sessionId)
+    sendJson(response, 200, { ok: true, deleted })
+  })
+
+  add('POST', `${PREFIX}/history/clear`, async (request, response) => {
+    const body = toRecord(await readJsonBody(request))
+    if (body.confirm !== true) {
+      throw new K8sConsoleError('清空全部历史需要显式确认：{ confirm: true }', 'CONFIRM_REQUIRED', 400)
+    }
+    const removed = deps.history.clear()
+    sendJson(response, 200, { ok: true, removed })
   })
 
   return routes

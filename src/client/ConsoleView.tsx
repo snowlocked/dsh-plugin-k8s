@@ -46,6 +46,28 @@ const EXAMPLES = [
   'get events -n <ns> --sort-by=.lastTimestamp',
 ]
 
+/* 命令历史跨刷新持久化（localStorage，按 kubeconfig 分开存）。 */
+const cmdHistoryKey = (kubeId: string): string => `dsh-k8s-console.cmdhist.v1.${kubeId}`
+const MAX_CMD_HISTORY = 100
+
+function loadCmdHistory(kubeId: string): string[] {
+  try {
+    const raw = window.localStorage.getItem(cmdHistoryKey(kubeId))
+    const parsed = raw ? (JSON.parse(raw) as unknown) : null
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string').slice(-MAX_CMD_HISTORY) : []
+  } catch {
+    return []
+  }
+}
+
+function saveCmdHistory(kubeId: string, items: string[]): void {
+  try {
+    window.localStorage.setItem(cmdHistoryKey(kubeId), JSON.stringify(items.slice(-MAX_CMD_HISTORY)))
+  } catch {
+    /* localStorage 不可用时静默 */
+  }
+}
+
 function toneText(reason?: string): string {
   switch (reason) {
     case 'timeout': return '已超时被终止'
@@ -62,7 +84,7 @@ export const ConsoleView = forwardRef<ConsoleHandle, ConsoleViewProps>(function 
   const [running, setRunning] = useState(false)
   const [entries, setEntries] = useState<OutEntry[]>([])
   const [exitInfo, setExitInfo] = useState<ExitInfo | null>(null)
-  const [history, setHistory] = useState<string[]>([])
+  const [history, setHistory] = useState<string[]>(() => loadCmdHistory(kube.id))
   const [historyIndex, setHistoryIndex] = useState(-1)
   const [busyNote, setBusyNote] = useState<string | null>(null)
 
@@ -100,7 +122,11 @@ export const ConsoleView = forwardRef<ConsoleHandle, ConsoleViewProps>(function 
     setExitInfo(null)
     setHistoryIndex(-1)
     push({ kind: 'cmd', text: clean })
-    setHistory((previous) => [...previous.slice(-99), clean])
+    setHistory((previous) => {
+      const next = [...previous.slice(-(MAX_CMD_HISTORY - 1)), clean]
+      saveCmdHistory(kube.id, next)
+      return next
+    })
 
     const handleEvent = (event: StreamEvent): void => {
       if (event.type === 'start') {
@@ -110,6 +136,8 @@ export const ConsoleView = forwardRef<ConsoleHandle, ConsoleViewProps>(function 
         const channel = event.channel === 'stderr' ? 'stderr' : 'stdout'
         const textChunk = typeof event.text === 'string' ? event.text : ''
         if (textChunk) push({ kind: 'out', channel, text: textChunk })
+      } else if (event.type === 'note') {
+        push({ kind: 'sys', text: String(event.text ?? ''), tone: 'muted' })
       } else if (event.type === 'exit') {
         const code = typeof event.code === 'number' ? event.code : null
         const signalValue = typeof event.signal === 'string' ? event.signal : null
@@ -262,7 +290,7 @@ export const ConsoleView = forwardRef<ConsoleHandle, ConsoleViewProps>(function 
           value={input}
           onChange={(event) => setInput(event.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={'kubectl 命令（可省略前缀 kubectl）\n例如：get pods -A\n\nEnter 执行 · Shift+Enter 换行 · ↑/↓ 历史 · 非交互（logs -f 等长命令请用中止按钮）'}
+          placeholder={'kubectl 命令（可省略前缀 kubectl）\n例如：get pods -A、get pods -A | grep <关键词>\n\nEnter 执行 · Shift+Enter 换行 · ↑/↓ 历史（已持久化）\n支持管道过滤：| grep / head / tail / sort / wc -l（进程内实现）· 非交互'}
           spellCheck={false}
           rows={3}
         />

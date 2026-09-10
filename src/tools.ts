@@ -11,8 +11,9 @@
  */
 import { join } from 'node:path'
 import { K8sConsoleError, asError } from './errors.ts'
-import { execKubectl, kubectlCommand, normalizeKubectlArgs, splitCommand } from './kubectl.ts'
+import { execKubectl, kubectlCommand } from './kubectl.ts'
 import type { KubectlLocator } from './kubectl.ts'
+import { applyOutputFilters, describeFilters, parsePipeline } from './pipeline.ts'
 import { parseKubeconfigMeta } from './meta.ts'
 import type { KubeConfigRecord } from './types.ts'
 import type { KubeStore } from './store.ts'
@@ -167,6 +168,9 @@ export async function registerK8sTools(sctx: ToolsSctx, deps: K8sToolsDeps): Pro
     description:
       '在某个已保存的 kubeconfig（可加 context / namespace 参数）上执行**只读** kubectl 命令并返回输出文本。'
       + `command 可省略 kubectl 前缀，仅支持只读动词：${READONLY_VERBS_TEXT}；`
+      + '支持在 command 里用管道做进程内过滤（非 shell）：| grep [-i -v -n -c -w -E -F] [-e] <pattern>、| head -n N、| tail -n N、| sort [-r] [-u]、| wc -l，'
+      + '例如 "get pods -n dji | grep core"、"get pods -A | grep CrashLoopBackOff | head -n 20"；'
+      + '需要筛选输出时优先使用管道过滤，不要让用户手动肉眼查找。'
       + '写类动词（apply/delete/edit/scale/exec/port-forward/create/rollout…）会被拒绝，需写操作时请用户到 K8s 控制台手动执行。'
       + '用法示例：k8s_query(kubeconfig=<id 或名称>, command="get pods -A")；'
       + '看某命名空间：k8s_query(kubeconfig=…, namespace=default, command="get deployments")；'
@@ -174,7 +178,7 @@ export async function registerK8sTools(sctx: ToolsSctx, deps: K8sToolsDeps): Pro
       + 'namespace/context 请用参数传入，不要写进 command（避免与参数冲突）。返回输出默认截断并提示，只读不产生任何修改。',
     parameters: {
       kubeconfig: { type: 'string', description: 'kubeconfig 的 id 或名称（用 k8s_kubeconfigs 查看）' },
-      command: { type: 'string', description: '只读 kubectl 命令，可省略 kubectl 前缀，例如 "get pods -A"、"-n kube-system get configmaps"、"-A top nodes"；不支持管道/重定向（参数数组直接传给 kubectl）' },
+      command: { type: 'string', description: '只读 kubectl 命令，可省略 kubectl 前缀，例如 "get pods -A"、"-n kube-system get configmaps"；支持管道进程内过滤（| grep / head / tail / sort / wc -l），如 "get pods -n dji | grep core"；不支持重定向、&&、|| 或任意 shell 命令' },
       context: { type: 'string', description: '可选：该 kubeconfig 下要用的 context 名称（默认用文件里的 current-context）' },
       namespace: { type: 'string', description: '可选：目标命名空间（等价于命令自带 -n <namespace>；留空则用 context 默认/全部资源所在范围）' },
     },
@@ -205,7 +209,14 @@ export async function registerK8sTools(sctx: ToolsSctx, deps: K8sToolsDeps): Pro
       if (!rawCommand) {
         return { ok: false, error: `command 不能为空。用法示例：k8s_query(kubeconfig="${record.name}", command="get pods -A")` }
       }
-      const tokens = normalizeKubectlArgs(splitCommand(rawCommand))
+      // 管道解析：第一段 kubectl，后续段进程内过滤器（grep/head/tail/sort/wc）
+      let pipeline
+      try {
+        pipeline = parsePipeline(rawCommand)
+      } catch (reason) {
+        return { ok: false, error: asError(reason).message }
+      }
+      const tokens = pipeline.kubectl
       if (tokens.length === 0) {
         return { ok: false, error: 'command 无法解析出有效参数' }
       }
@@ -259,7 +270,14 @@ export async function registerK8sTools(sctx: ToolsSctx, deps: K8sToolsDeps): Pro
         }
       }
 
-      const body = stdout || stderr
+      let body = stdout || stderr
+      if (pipeline.filters.length > 0) {
+        const original = body
+        body = applyOutputFilters(stdout, pipeline.filters)
+        if (body.trim() === '' && !stdout.trim() && stderr.trim() !== '') body = stderr
+        noteBits.push(`已应用管道过滤（插件进程内执行，非 shell）：${describeFilters(pipeline.filters)}`)
+        if (body.trim() === '' && original.trim() !== '') noteBits.push('过滤后无匹配输出')
+      }
       const text = body.slice(0, 120_000)
       if (body.length > 120_000) noteBits.push('输出过长，仅展示前 120000 字符')
       if (stderr && stderr.length > 0 && !stdout) noteBits.push('仅有 stderr 输出')

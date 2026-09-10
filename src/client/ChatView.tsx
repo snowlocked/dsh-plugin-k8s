@@ -6,8 +6,8 @@
  *   粘贴的报错/输出（把输出贴进来提问即可）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { k8sApi, errText, flattenAiModels } from './client.ts'
-import type { AiModelsPayload, PublicKubeConfig, StreamEvent } from './client.ts'
+import { k8sApi, errText, flattenAiModels, formatTime } from './client.ts'
+import type { AiModelsPayload, ChatSession, ChatSessionSummary, PublicKubeConfig, StreamEvent } from './client.ts'
 
 export interface ChatViewProps {
   kube: PublicKubeConfig
@@ -81,6 +81,15 @@ export function ChatView({ kube, onRunCommand }: ChatViewProps): JSX.Element {
   const abortRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  /** 服务端持久化的对话会话 id（首条消息后创建；载入历史时指向历史会话） */
+  const sessionRef = useRef<string | null>(null)
+  // 历史抽屉
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [historyBusy, setHistoryBusy] = useState(false)
+  const [historyAllClusters, setHistoryAllClusters] = useState(false)
+  const [historyKeyword, setHistoryKeyword] = useState('')
+  const [historySessions, setHistorySessions] = useState<ChatSessionSummary[]>([])
+  const [historyDetail, setHistoryDetail] = useState<ChatSession | null>(null)
 
   const loadModels = useCallback(async (): Promise<void> => {
     setModelsBusy(true)
@@ -134,6 +143,28 @@ export function ChatView({ kube, onRunCommand }: ChatViewProps): JSX.Element {
     abortRef.current?.abort()
   }, [])
 
+  /** 把一条消息落库到服务端历史（失败不影响对话本身）。返回是否成功。 */
+  const saveMessage = useCallback(async (message: {
+    role: 'user' | 'assistant'
+    content: string
+    provider?: string
+    model?: string
+    error?: boolean
+  }): Promise<void> => {
+    try {
+      const result = await k8sApi.historyAppend({
+        ...(sessionRef.current ? { sessionId: sessionRef.current } : {}),
+        kubeId: kube.id,
+        kubeName: kube.name,
+        context: kube.currentContext,
+        message: { role: message.role, content: message.content, at: new Date().toISOString(), ...(message.provider ? { provider: message.provider } : {}), ...(message.model ? { model: message.model } : {}), ...(message.error === true ? { error: true } : {}) },
+      })
+      sessionRef.current = result.sessionId
+    } catch {
+      /* 历史保存失败静默：不打断对话 */
+    }
+  }, [kube.id, kube.name, kube.currentContext])
+
   const send = useCallback(async (): Promise<void> => {
     const text = input.trim()
     if (!text || busy) return
@@ -150,6 +181,13 @@ export function ChatView({ kube, onRunCommand }: ChatViewProps): JSX.Element {
     setBusy(true)
     abortRef.current = new AbortController()
     const signal = abortRef.current.signal
+    void saveMessage({ role: 'user', content: text })
+
+    // 流式期间本地累积 assistant 输出（state 更新是异步的，历史保存用本地副本）
+    let acc = ''
+    let doneProvider: string | undefined
+    let doneModel: string | undefined
+    let streamError: string | null = null
 
     try {
       await k8sApi.chat(
@@ -161,19 +199,23 @@ export function ChatView({ kube, onRunCommand }: ChatViewProps): JSX.Element {
         },
         (event: StreamEvent) => {
           if (event.type === 'delta' && typeof event.text === 'string') {
+            acc += event.text
             updateLastAssistant({ content: event.text })
           } else if (event.type === 'done') {
+            if (typeof event.provider === 'string') doneProvider = event.provider
+            if (typeof event.model === 'string') doneModel = event.model
             updateLastAssistant({
               state: 'done',
               meta: {
-                ...(typeof event.provider === 'string' ? { provider: event.provider } : {}),
-                ...(typeof event.model === 'string' ? { model: event.model } : {}),
+                ...(doneProvider ? { provider: doneProvider } : {}),
+                ...(doneModel ? { model: doneModel } : {}),
               },
             })
           } else if (event.type === 'aborted') {
             updateLastAssistant({ state: 'done' })
           } else if (event.type === 'error') {
-            updateLastAssistant({ state: 'error', content: `⚠️ ${String(event.message ?? 'AI 出错')}` })
+            streamError = String(event.message ?? 'AI 出错')
+            updateLastAssistant({ state: 'error', content: `⚠️ ${streamError}` })
           }
         },
         signal,
@@ -182,14 +224,24 @@ export function ChatView({ kube, onRunCommand }: ChatViewProps): JSX.Element {
       if (signal.aborted) {
         updateLastAssistant({ state: 'done' })
       } else {
-        const text2 = await errText(reason)
-        updateLastAssistant({ state: 'error', content: `⚠️ ${text2}` })
+        streamError = await errText(reason)
+        updateLastAssistant({ state: 'error', content: `⚠️ ${streamError}` })
       }
     } finally {
       setBusy(false)
       abortRef.current = null
+      // 落库本条 assistant 回复（有内容或报错才存；中止时保留已生成的部分）
+      if (acc.trim() !== '' || streamError) {
+        void saveMessage({
+          role: 'assistant',
+          content: streamError ? `⚠️ ${streamError}` : acc,
+          ...(doneProvider ? { provider: doneProvider } : {}),
+          ...(doneModel ? { model: doneModel } : {}),
+          ...(streamError ? { error: true } : {}),
+        })
+      }
     }
-  }, [input, busy, messages, selectedModel, kube.id, appendMessage, updateLastAssistant])
+  }, [input, busy, messages, selectedModel, kube.id, appendMessage, updateLastAssistant, saveMessage])
 
   const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>): void => {
     if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
@@ -202,7 +254,83 @@ export function ChatView({ kube, onRunCommand }: ChatViewProps): JSX.Element {
     if (busy) stop()
     setMessages([])
     setError(null)
+    sessionRef.current = null // 后续消息写入新的历史会话
   }, [busy, stop])
+
+  /* ---------------- 历史抽屉 ---------------- */
+
+  const refreshHistory = useCallback(async (keyword?: string): Promise<void> => {
+    setHistoryBusy(true)
+    try {
+      const result = await k8sApi.historyList({
+        ...(keyword && keyword.trim() !== '' ? { keyword: keyword.trim() } : {}),
+        ...(!historyAllClusters ? { kubeId: kube.id } : {}),
+        limit: 100,
+      })
+      setHistorySessions(result.sessions ?? [])
+      setHistoryDetail(null)
+    } catch (reason) {
+      setError(`历史加载失败：${await errText(reason)}`)
+    } finally {
+      setHistoryBusy(false)
+    }
+  }, [historyAllClusters, kube.id])
+
+  const toggleHistory = useCallback((): void => {
+    const next = !historyOpen
+    setHistoryOpen(next)
+    if (next) void refreshHistory(historyKeyword)
+  }, [historyOpen, refreshHistory, historyKeyword])
+
+  const searchHistory = useCallback(async (): Promise<void> => {
+    await refreshHistory(historyKeyword)
+  }, [refreshHistory, historyKeyword])
+
+  const openHistoryDetail = useCallback(async (sessionId: string): Promise<void> => {
+    if (historyDetail?.id === sessionId) {
+      setHistoryDetail(null)
+      return
+    }
+    setHistoryBusy(true)
+    try {
+      const result = await k8sApi.historyGet(sessionId)
+      setHistoryDetail(result.session)
+    } catch (reason) {
+      setError(`历史会话读取失败：${await errText(reason)}`)
+    } finally {
+      setHistoryBusy(false)
+    }
+  }, [historyDetail])
+
+  /** 载入历史会话到当前对话区，并继续往该会话追加新消息。 */
+  const loadHistorySession = useCallback((session: ChatSession): void => {
+    if (busy) return // 正在生成时不载入，避免半截回复写进历史会话
+    setMessages(session.messages.map((message) => ({
+      key: nextMsgKey(),
+      role: message.role,
+      content: message.content,
+      state: message.error ? ('error' as const) : ('done' as const),
+      ...(message.provider || message.model
+        ? { meta: { ...(message.provider ? { provider: message.provider } : {}), ...(message.model ? { model: message.model } : {}) } }
+        : {}),
+    })))
+    sessionRef.current = session.id
+    setHistoryOpen(false)
+    setError(null)
+    inputRef.current?.focus()
+  }, [busy])
+
+  const deleteHistorySession = useCallback(async (sessionId: string): Promise<void> => {
+    if (!window.confirm('确定删除这条历史会话？删除后不可恢复。')) return
+    try {
+      await k8sApi.historyDelete(sessionId)
+      if (sessionRef.current === sessionId) sessionRef.current = null
+      if (historyDetail?.id === sessionId) setHistoryDetail(null)
+      await refreshHistory(historyKeyword)
+    } catch (reason) {
+      setError(`历史会话删除失败：${await errText(reason)}`)
+    }
+  }, [historyDetail, refreshHistory, historyKeyword])
 
   const lastAssistant = [...messages].reverse().find((msg) => msg.role === 'assistant' && msg.state === 'done')
   const lastCommand = lastAssistant ? extractKubectlCommand(lastAssistant.content) : null
@@ -264,7 +392,8 @@ export function ChatView({ kube, onRunCommand }: ChatViewProps): JSX.Element {
           </select>
         </label>
         <button className="kc-btn-sm" onClick={() => void loadModels()} disabled={modelsBusy} title="重新枚举 DSH 模型">↻ 模型</button>
-        <button className="kc-btn-sm" onClick={clearChat} disabled={messages.length === 0 && !busy} title="清空本会话对话">清空对话</button>
+        <button className={`kc-btn-sm${historyOpen ? ' kc-btn-sm-active' : ''}`} onClick={toggleHistory} title="查看 / 搜索已保存的历史对话（逐条落盘，刷新与重启后仍可查询）">🕘 历史</button>
+        <button className="kc-btn-sm" onClick={clearChat} disabled={messages.length === 0 && !busy} title="清空本会话对话（开启新一轮，历史仍保留）">清空对话</button>
         <span className="kc-grow" />
         <span className="kc-chat-cluster" title="AI 系统提示中会携带该集群信息">
           ⎈ {kube.name} · {kube.currentContext ?? ''}
@@ -278,6 +407,132 @@ export function ChatView({ kube, onRunCommand }: ChatViewProps): JSX.Element {
         </div>
       ) : null}
       {error ? <div className="kc-chat-warn">⚠️ {error}</div> : null}
+
+      {historyOpen ? (
+        <div className="kc-history">
+          <div className="kc-history-head">
+            <b>🕘 对话历史</b>
+            <label className="kc-history-all" title="取消勾选则只看当前集群的历史">
+              <input
+                type="checkbox"
+                checked={historyAllClusters}
+                onChange={(event) => {
+                  const checked = event.target.checked
+                  setHistoryAllClusters(checked)
+                  window.setTimeout(() => {
+                    void (async () => {
+                      setHistoryBusy(true)
+                      try {
+                        const result = await k8sApi.historyList({
+                          ...(historyKeyword.trim() !== '' ? { keyword: historyKeyword.trim() } : {}),
+                          ...(!checked ? { kubeId: kube.id } : {}),
+                          limit: 100,
+                        })
+                        setHistorySessions(result.sessions ?? [])
+                        setHistoryDetail(null)
+                      } catch {
+                        /* 静默：列表失败不阻塞对话 */
+                      } finally {
+                        setHistoryBusy(false)
+                      }
+                    })()
+                  }, 0)
+                }}
+              />
+              全部集群
+            </label>
+            <span className="kc-grow" />
+            <span className="kc-muted">{historySessions.length} 条会话</span>
+            <button className="kc-btn-sm" onClick={toggleHistory} title="关闭历史面板">✕</button>
+          </div>
+          <div className="kc-history-search">
+            <input
+              value={historyKeyword}
+              onChange={(event) => setHistoryKeyword(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                  event.preventDefault()
+                  void searchHistory()
+                }
+              }}
+              placeholder="搜索历史消息关键词（回车搜索）…"
+              spellCheck={false}
+            />
+            <button className="kc-btn-sm" onClick={() => void searchHistory()} disabled={historyBusy}>搜索</button>
+            <button
+              className="kc-btn-sm"
+              onClick={() => {
+                setHistoryKeyword('')
+                void refreshHistory('')
+              }}
+              disabled={historyBusy}
+              title="清空关键词并刷新"
+            >
+              重置
+            </button>
+          </div>
+          <div className="kc-history-list">
+            {historyBusy && historySessions.length === 0 ? <div className="kc-muted">加载中…</div> : null}
+            {!historyBusy && historySessions.length === 0 ? (
+              <div className="kc-muted">暂无历史会话。发出的对话会自动逐条保存（服务端落盘），刷新 / 重启后仍可在此搜索查询。</div>
+            ) : null}
+            {historySessions.map((session) => (
+              <div key={session.id} className={`kc-history-item${historyDetail?.id === session.id ? ' kc-history-item-open' : ''}`}>
+                <div className="kc-history-item-main" onClick={() => void openHistoryDetail(session.id)} title="点击展开完整记录">
+                  <div className="kc-history-item-title">{session.preview || '（无文字内容）'}</div>
+                  <div className="kc-history-item-meta">
+                    ⎈ {session.kubeName} · {session.messageCount} 条 · {formatTime(session.updatedAt)}
+                  </div>
+                  {session.snippet ? <div className="kc-history-item-snippet">命中：{session.snippet}</div> : null}
+                </div>
+                <div className="kc-history-item-actions">
+                  <button
+                    className="kc-btn-sm"
+                    title="载入到对话区并继续追问（新消息会继续保存到该会话）"
+                    disabled={busy}
+                    onClick={() => {
+                      void (async () => {
+                        try {
+                          const detail = historyDetail?.id === session.id
+                            ? historyDetail
+                            : (await k8sApi.historyGet(session.id)).session
+                          loadHistorySession(detail)
+                        } catch (reason) {
+                          setError(`历史会话读取失败：${await errText(reason)}`)
+                        }
+                      })()
+                    }}
+                  >
+                    载入
+                  </button>
+                  <button className="kc-btn-sm kc-history-delete" onClick={() => void deleteHistorySession(session.id)} title="删除该历史会话">删除</button>
+                </div>
+                {historyDetail?.id === session.id ? (
+                  <div className="kc-history-detail">
+                    {historyDetail.messages.map((message, index) => (
+                      <div key={index} className={`kc-history-msg kc-history-msg-${message.role}${message.error ? ' kc-history-msg-error' : ''}`}>
+                        <span className="kc-history-msg-role">{message.role === 'user' ? '🧑' : '🤖'}</span>
+                        <div className="kc-history-msg-body">
+                          {splitSegments(message.content).map((segment, sIndex) =>
+                            segment.kind === 'code'
+                              ? <pre key={sIndex} className="kc-history-msg-code">{segment.text}</pre>
+                              : <span key={sIndex}>{segment.text}</span>,
+                          )}
+                          {message.provider || message.model ? (
+                            <div className="kc-history-msg-meta">{message.provider ?? ''}{message.model ? `/${message.model}` : ''} · {formatTime(message.at)}</div>
+                          ) : (
+                            <div className="kc-history-msg-meta">{formatTime(message.at)}</div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       <div className="kc-chat-scroll" ref={scrollRef}>
         {messages.length === 0 ? (

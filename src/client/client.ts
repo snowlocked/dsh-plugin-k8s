@@ -62,6 +62,40 @@ export interface KubeSaveInput {
   filePath?: string
 }
 
+/** 历史消息（服务端 src/history.ts 同构）。 */
+export interface HistoryMessage {
+  role: 'user' | 'assistant'
+  content: string
+  at: string
+  provider?: string
+  model?: string
+  error?: boolean
+}
+
+export interface ChatSessionSummary {
+  id: string
+  kubeId: string
+  kubeName: string
+  context?: string
+  startedAt: string
+  updatedAt: string
+  messageCount: number
+  preview: string
+  snippet?: string
+}
+
+export interface ChatSession extends Omit<ChatSessionSummary, 'messageCount' | 'preview' | 'snippet'> {
+  messages: HistoryMessage[]
+}
+
+export interface HistoryAppendInput {
+  sessionId?: string
+  kubeId: string
+  kubeName: string
+  context?: string
+  message: HistoryMessage
+}
+
 /** SSE 流式事件（/run 与 /ai/chat 通用，type 区分）。 */
 export type StreamEvent = Record<string, unknown> & { type: string }
 
@@ -192,6 +226,16 @@ export const k8sApi = {
     streamPost('/run', options, onEvent, signal),
   chat: (options: { id?: string; provider?: string; model?: string; history: Array<{ role: 'user' | 'assistant'; content: string }> }, onEvent: (e: StreamEvent) => void, signal?: AbortSignal) =>
     streamPost('/ai/chat', options, onEvent, signal),
+  historyAppend: (input: HistoryAppendInput) =>
+    post<{ ok: boolean; sessionId: string; updatedAt: string; messageCount: number }>('/history/append', input),
+  historyList: (options?: { keyword?: string; kubeId?: string; limit?: number }) =>
+    post<{ ok: boolean; sessions: ChatSessionSummary[] }>('/history/list', options ?? {}),
+  historyGet: (sessionId: string) =>
+    post<{ ok: boolean; session: ChatSession }>('/history/get', { sessionId }),
+  historyDelete: (sessionId: string) =>
+    post<{ ok: boolean; deleted: boolean }>('/history/delete', { sessionId }),
+  historyClear: () =>
+    post<{ ok: boolean; removed: number }>('/history/clear', { confirm: true }),
 }
 
 /** 把服务端嵌套的 providers/models 拍平成选择项；无模型的 provider 得到“默认模型”项。 */

@@ -6,14 +6,19 @@
  * AI 对话 SSE）。客户端模块（浏览器 UI）是独立 bundle，见 src/client/index.tsx。
  */
 
-import { resolve } from 'node:path'
+import { resolve, join } from 'node:path'
 import { createKubeStore, defaultDataDir, isValidKubeId } from './store.ts'
 import type { KubeStore } from './store.ts'
+import { createHistoryStore } from './history.ts'
+import type { HistoryStore } from './history.ts'
 import { buildApiRoutes } from './http.ts'
 import type { HttpRequest, HttpResponse, HttpRoute } from './http.ts'
 import { kubeconfigCatalogLines, registerK8sTools } from './tools.ts'
 
 export { assertReadOnlyCommand } from './tools.ts'
+export { parsePipeline, applyOutputFilters, describeFilters, FILTERS_HELP_TEXT } from './pipeline.ts'
+export { createHistoryStore } from './history.ts'
+export type { HistoryStore, ChatSession, ChatSessionSummary, HistoryMessage } from './history.ts'
 
 export const name = 'dsh-plugin-k8s'
 /** 服务端需要等待注入的服务（webServer 最先，其余按需取） */
@@ -65,6 +70,7 @@ export function apply(ctx: CtxLike, config: PluginConfig = {}): void {
 
   const dataDir = resolve(config.dataDir && config.dataDir.length > 0 ? config.dataDir : defaultDataDir())
   const store: KubeStore = createKubeStore(dataDir, (message) => log('info', message))
+  const history: HistoryStore = createHistoryStore(join(dataDir, 'history'), (message) => log('info', message))
 
   const locator = { configured: config.kubectlBin?.trim() || undefined }
   const runtime = {
@@ -76,6 +82,7 @@ export function apply(ctx: CtxLike, config: PluginConfig = {}): void {
     sctx.effect(() => {
       const routes: HttpRoute[] = buildApiRoutes({
         store,
+        history,
         locator,
         runtime,
         log,
@@ -127,8 +134,11 @@ export function apply(ctx: CtxLike, config: PluginConfig = {}): void {
           '- k8s_query 只支持只读动词：get / describe / logs / top / explain / version / api-resources /',
           '  api-versions / auth can-i / cluster-info；写类动词（apply/delete/edit/scale/exec…）会被拒绝，',
           '  如需写操作，提醒用户打开左侧“K8s”工作台在命令控制台手动执行。',
+          '- k8s_query 的 command 支持管道做进程内过滤（非 shell）：| grep [-i -v -n -c -w -E -F] [-e] <pattern>、',
+          '  | head -n N、| tail -n N、| sort [-r] [-u]、| wc -l；资源多、输出大时优先用管道筛选关键行。',
           '示例：“查一下 dev 集群的 pod”→ k8s_kubeconfigs 找 dev → k8s_query(kubeconfig=…, command="get pods -A")；',
-          '“看 xx 命名空间的 deployment 状态”→ k8s_query(…, namespace=xx, command="get deployments")。',
+          '“看 xx 命名空间的 deployment 状态”→ k8s_query(…, namespace=xx, command="get deployments")；',
+          '“dji 命名空间里带 core 的资源”→ k8s_query(…, namespace=dji, command="get pods,deployments | grep core")。',
           '输出较大时会被截断并提示；全部查询只读，不会改动集群。',
           '',
           '当前已保存的 kubeconfig（插件启动时快照，如有出入以 k8s_kubeconfigs 返回为准）：',
